@@ -11,6 +11,7 @@ from mojo_opset import MojoSdpa
 from mojo_opset import MojoPagedPrefillSWA
 from mojo_opset import MojoPagedDecodeSWA
 from mojo_opset import MojoSWA
+from mojo_opset import MojoSWAFunction
 from mojo_opset.tests.utils import auto_switch_platform
 from mojo_opset.tests.utils import bypass_not_implemented
 
@@ -667,3 +668,155 @@ def test_swa_infer(
             softmax_scale=softmax_scale,
         )
     )
+
+
+test_configs_swa_function = [
+    (2, 16, 4, 128, 1024, 0, torch.float32, "M_F32"),
+    (2, 16, 4, 96, 1024, 0, torch.bfloat16, "M_BF16_PADDIM"),
+    (2, 16, 4, 128, 4096, 0, torch.bfloat16, "M_BF16_LONG"),
+]
+
+
+class _SWAFunctionForwardRunner:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    def __call__(self):
+        return MojoSWAFunction.apply(*self.args, **self.kwargs)
+
+
+class _SWAFunctionBackwardRunner:
+    def __init__(self, o, grad_out, q, k, v):
+        self.o = o
+        self.grad_out = grad_out
+        self.q = q
+        self.k = k
+        self.v = v
+
+    def __call__(self):
+        return torch.autograd.grad(
+            self.o,
+            [self.q, self.k, self.v],
+            grad_outputs=self.grad_out,
+            retain_graph=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "query, key, value, cu_q_lens, cu_total_seq_lens",
+    [
+        pytest.param(
+            *generate_sdpa_data(
+                batch_size=B,
+                num_q_heads=Q_H,
+                num_kv_heads=KV_H,
+                head_dim=D,
+                max_q_len=Q_LEN,
+                max_kv_computed_len=KV_COMPUTED_LEN,
+                dtype=dtype,
+            ),
+            id=ID,
+        )
+        for B, Q_H, KV_H, D, Q_LEN, KV_COMPUTED_LEN, dtype, ID in test_configs_swa_function
+    ],
+)
+@pytest.mark.parametrize("gqa_interleave, global_window, local_window", [
+    (True, 4, 255),
+    (False, 4, 1023),
+])
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_swa_function_fwd_perf(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    cu_total_seq_lens: torch.Tensor,
+    gqa_interleave: bool,
+    global_window: int,
+    local_window: int,
+):
+    head_dim = query.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = query.clone().detach()
+    k = key.clone().detach()
+    v = value.clone().detach()
+
+    runner = _SWAFunctionForwardRunner(
+        q,
+        k,
+        v,
+        cu_q_lens,
+        cu_total_seq_lens,
+        True,
+        local_window,
+        global_window,
+        softmax_scale,
+        gqa_interleave,
+        True,
+    )
+
+    perf(lambda: (runner(), q, local_window, global_window, gqa_interleave)[0])  # noqa: F821
+
+
+@pytest.mark.parametrize(
+    "query, key, value, cu_q_lens, cu_total_seq_lens",
+    [
+        pytest.param(
+            *generate_sdpa_data(
+                batch_size=B,
+                num_q_heads=Q_H,
+                num_kv_heads=KV_H,
+                head_dim=D,
+                max_q_len=Q_LEN,
+                max_kv_computed_len=KV_COMPUTED_LEN,
+                dtype=dtype,
+            ),
+            id=ID,
+        )
+        for B, Q_H, KV_H, D, Q_LEN, KV_COMPUTED_LEN, dtype, ID in test_configs_swa_function
+    ],
+)
+@pytest.mark.parametrize("gqa_interleave, global_window, local_window", [
+    (True, 4, 255),
+    (False, 4, 1023),
+])
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_swa_function_bwd_perf(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    cu_total_seq_lens: torch.Tensor,
+    gqa_interleave: bool,
+    global_window: int,
+    local_window: int,
+):
+    head_dim = query.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = query.clone().detach().requires_grad_(True)
+    k = key.clone().detach().requires_grad_(True)
+    v = value.clone().detach().requires_grad_(True)
+
+    o = MojoSWAFunction.apply(
+        q,
+        k,
+        v,
+        cu_q_lens,
+        cu_total_seq_lens,
+        True,
+        local_window,
+        global_window,
+        softmax_scale,
+        gqa_interleave,
+        True,
+    )
+    grad_out = torch.randn_like(o)
+
+    runner = _SWAFunctionBackwardRunner(o, grad_out, q, k, v)
+
+    perf(lambda: (runner(), q, local_window, global_window, gqa_interleave)[0])  # noqa: F821
