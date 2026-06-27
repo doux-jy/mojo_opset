@@ -5,11 +5,19 @@ from .utils import get_num_cores
 
 AUX_MASK_SIZE = 256
 AUX_MASK = None
+AUX_MASK_CACHE = {}
 
 
 def get_aux_mask():
     global AUX_MASK
     global AUX_MASK_SIZE
+    # cache aux mask by current NPU device and mask size so repeated calls do not
+    # rebuild five bool matrices and concatenate them.
+    device_idx = torch.npu.current_device()
+    cache_key = (device_idx, AUX_MASK_SIZE)
+    cached = AUX_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return AUX_MASK_SIZE, cached
     if AUX_MASK is None:
         AUX_MASK = torch.cat(
             [
@@ -36,6 +44,7 @@ def get_aux_mask():
             ],
             dim=0,
         )
+    AUX_MASK_CACHE[cache_key] = AUX_MASK
     return AUX_MASK_SIZE, AUX_MASK
 
 
@@ -95,6 +104,9 @@ def _swa_transposed_range_blocks(
             if LOCAL_WINDOW_SIZE is not None:
                 # otherwise, it can only be attented as sliding window tokens
                 cur_q_end = max(kv_block_start_id + kv_block_len + LOCAL_WINDOW_SIZE - kv_computed_len, 0)
+                # clamp sliding upper to q_seq_len so we never iterate empty q-blocks past the end
+                if cur_q_end > q_seq_len:
+                    cur_q_end = q_seq_len
             if GLOBAL_WINDOW_SIZE is not None:
                 if kv_block_start_id < GLOBAL_WINDOW_SIZE:
                     # sink token is attended by all succeeding tokens
@@ -103,6 +115,10 @@ def _swa_transposed_range_blocks(
                     # Not attended
                     cur_q_start = 0
                     cur_q_end = 0
+        # skip entirely when the kv block is past the highest q position that can reach it
+        if cur_q_end <= cur_q_start:
+            cur_q_start = 0
+            cur_q_end = 0
     else:
         # full attention, iterate over all queries
         cur_q_start = 0
@@ -206,8 +222,7 @@ def _sdpa_acc_fwd_MxN(
     # -- Compute qk ----
 
     # Load (transposed) K block
-    k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    k_T = tl.trans(k)
+    k_T = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
     qk = tl.dot(q, k_T)
     # tl.compile_hint(qk, "tile_cube_loop")
 
@@ -443,11 +458,11 @@ def _sdpa_infer_kernel(
                 # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    shape=(HEAD_DIM, kv_seq_len),
+                    strides=(stride_kd, stride_kt),
+                    offsets=(0, kv_block_start.to(tl.int32)),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_v_block_ptr = tl.make_block_ptr(
@@ -517,11 +532,11 @@ def _sdpa_infer_kernel(
                 # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    shape=(HEAD_DIM, kv_seq_len),
+                    strides=(stride_kd, stride_kt),
+                    offsets=(0, kv_block_start.to(tl.int32)),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_v_block_ptr = tl.make_block_ptr(
@@ -827,11 +842,11 @@ def _swa_paged_prefill_kernel(
                     mask = q_mask & kv_mask
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + physical_page_id * stride_kp + kv_head_id * stride_kh + kv_block_start_in_page * stride_kt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
+                    shape=(HEAD_DIM, kv_block_len),
+                    strides=(stride_kd, stride_kt),
                     offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 cur_v_block_ptr = tl.make_block_ptr(
                     base=v_ptr + physical_page_id * stride_vp + kv_head_id * stride_vh + kv_block_start_in_page * stride_vt,
@@ -905,11 +920,11 @@ def _swa_paged_prefill_kernel(
 
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + physical_page_id * stride_kp + kv_head_id * stride_kh + kv_block_start_in_page * stride_kt,
-                    shape=(kv_block_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
+                    shape=(HEAD_DIM, kv_block_len),
+                    strides=(stride_kd, stride_kt),
                     offsets=(0, 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 cur_v_block_ptr = tl.make_block_ptr(
                     base=v_ptr + physical_page_id * stride_vp + kv_head_id * stride_vh + kv_block_start_in_page * stride_vt,
@@ -1717,11 +1732,11 @@ def _swa_fwd_kernel(
             lse_i_ptr = lse_ptr + q_head_id * stride_lse_h + q_start * stride_lse_t
             # k_block_ptr = tl.make_block_ptr(
             #     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_kt, stride_kd),
+            #     shape=(HEAD_DIM, kv_seq_len),
+            #     strides=(stride_kd, stride_kt),
             #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
+            #     block_shape=(BLOCK_D, BLOCK_N),
+            #     order=(0, 1),
             # )
             # v_block_ptr = tl.make_block_ptr(
             #     base=v_ptr + kv_start * stride_vt + kv_head_id * stride_vh,
@@ -1753,7 +1768,11 @@ def _swa_fwd_kernel(
                 block_shape=(BLOCK_M, BLOCK_D),
                 order=(1, 0),
             )
-            cur_q_block = tl.load(cur_q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            # head_dim axis is fully covered (BLOCK_D == HEAD_DIM); the d-axis
+            # bounds check on the Q tile load is dead - drop it so the tile is
+            # loaded as one contiguous vector op and reused unchanged across
+            # every kv-block in this q-block task.
+            cur_q_block = tl.load(cur_q_block_ptr, boundary_check=(0,), padding_option="zero")
 
             num_global_window_blocks, non_global_window_start_block, num_total_blocks = _swa_split_blocks(
                 q_block_start + kv_computed_len,
@@ -1822,11 +1841,11 @@ def _swa_fwd_kernel(
                 # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    shape=(HEAD_DIM, kv_seq_len),
+                    strides=(stride_kd, stride_kt),
+                    offsets=(0, kv_block_start.to(tl.int32)),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_v_block_ptr = tl.make_block_ptr(
@@ -1896,11 +1915,11 @@ def _swa_fwd_kernel(
                 # cur_k_block_ptr = tl.advance(k_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_k_block_ptr = tl.make_block_ptr(
                     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-                    shape=(kv_seq_len, HEAD_DIM),
-                    strides=(stride_kt, stride_kd),
-                    offsets=(kv_block_start.to(tl.int32), 0),
-                    block_shape=(BLOCK_N, BLOCK_D),
-                    order=(1, 0),
+                    shape=(HEAD_DIM, kv_seq_len),
+                    strides=(stride_kd, stride_kt),
+                    offsets=(0, kv_block_start.to(tl.int32)),
+                    block_shape=(BLOCK_D, BLOCK_N),
+                    order=(0, 1),
                 )
                 # cur_v_block_ptr = tl.advance(v_block_ptr, (kv_block_start.to(tl.int32), 0))
                 cur_v_block_ptr = tl.make_block_ptr(
@@ -2142,9 +2161,9 @@ def _sdpa_single_block_bwd_dkdv(
     doT = tl.trans(do)
     dpT = tl.dot(v, doT)
 
-    # dsT = pT * (dpT - dT)
-    dsT = pT * (dpT - d[None, :]) * qk_scale
-    dsT_cast = dsT.to(q_T.dtype)
+    # dsT = pT * (dpT - dT) — fused multiply-cast into one expression so the
+    # compiler folds the bf16 cast into the same vector pipeline as the multiply.
+    dsT_cast = (pT * (dpT - d[None, :]) * qk_scale).to(q_T.dtype)
 
     # -- Compute dK ----
     # dk = dsT @ q
@@ -2194,9 +2213,9 @@ def _sdpa_single_block_bwd_dq(
     v_T = tl.trans(v)
     dp = tl.dot(do, v_T)
 
-    # ds = p * (dp - d)
-    ds = p * (dp - d[:, None]) * qk_scale
-    ds_cast = ds.to(q.dtype)
+    # ds = p * (dp - d) — fused multiply-cast into one expression so the
+    # compiler folds the bf16 cast into the same vector pipeline as the multiply.
+    ds_cast = (p * (dp - d[:, None]) * qk_scale).to(q.dtype)
 
     # -- Compute dK ----
     # dq = ds @ k
@@ -2209,7 +2228,7 @@ def _sdpa_single_block_bwd_dq(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
         for BM in [64, 128]
-        for BN in [64, 128]
+        for BN in [64]
         for MF in [True, False]
     ],
     key=["HEAD_DIM"],
@@ -2227,6 +2246,8 @@ def _swa_bwd_dkdv_kernel(
     bsz,
     cu_q_lens_ptr,
     cu_total_seq_lens_ptr,
+    task_table_ptr,
+    num_tasks_total,
     scale,
     stride_dkt,
     stride_dkh,
@@ -2280,8 +2301,13 @@ def _swa_bwd_dkdv_kernel(
     aux_mask_ptr_01t = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m
     aux_mask_ptr_10t = aux_mask_ptr + aux_mask_size * 1 * stride_mask_m + aux_mask_size * 2 * stride_mask_n
 
-    cu_kv_chunks = 0
-    for b_id in range(bsz):
+    # host-side task table — iterate flat (b_id, kv_block_id, kv_head_id) over pid-stride.
+    for task_id in range(pid, num_tasks_total, n_programs):
+        # Each task entry is 3 int32: b_id, kv_block_id, kv_head_id
+        b_id = tl.load(task_table_ptr + task_id * 3 + 0).to(tl.int32)
+        kv_block_id = tl.load(task_table_ptr + task_id * 3 + 1).to(tl.int32)
+        kv_head_id = tl.load(task_table_ptr + task_id * 3 + 2).to(tl.int32)
+
         kv_start = tl.load(cu_total_seq_lens_ptr + b_id).to(tl.int32)
         kv_end = tl.load(cu_total_seq_lens_ptr + b_id + 1).to(tl.int32)
         q_start = tl.load(cu_q_lens_ptr + b_id).to(tl.int32)
@@ -2291,48 +2317,7 @@ def _swa_bwd_dkdv_kernel(
         kv_seq_len = kv_end - kv_start
         kv_computed_len = kv_seq_len - q_seq_len
 
-        num_kv_chunks = tl.cdiv(kv_seq_len, BLOCK_N)
-
-        prev_kv_tasks = cu_kv_chunks * NUM_KV_HEADS
-        cu_kv_chunks += num_kv_chunks
-        new_kv_tasks = num_kv_chunks * NUM_KV_HEADS
-        for kv_task_id in range((prev_kv_tasks + pid) % n_programs, new_kv_tasks, n_programs):
-            kv_block_id = kv_task_id // NUM_KV_HEADS
-            kv_head_id = kv_task_id % NUM_KV_HEADS
-
-            # dk_block_ptr = tl.make_block_ptr(
-            #     base=dk_ptr + kv_start * stride_dkt + kv_head_id * stride_dkh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_dkt, stride_dkd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # dv_block_ptr = tl.make_block_ptr(
-            #     base=dv_ptr + kv_start * stride_dvt + kv_head_id * stride_dvh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_dvt, stride_dvd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # k_block_ptr = tl.make_block_ptr(
-            #     base=k_ptr + kv_start * stride_kt + kv_head_id * stride_kh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_kt, stride_kd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-            # v_block_ptr = tl.make_block_ptr(
-            #     base=v_ptr + kv_start * stride_vt + kv_head_id * stride_vh,
-            #     shape=(kv_seq_len, HEAD_DIM),
-            #     strides=(stride_vt, stride_vd),
-            #     offsets=(0, 0),
-            #     block_shape=(BLOCK_N, BLOCK_D),
-            #     order=(1, 0),
-            # )
-
+        if True:
             kv_block_start = kv_block_id * BLOCK_N
             kv_block_end = min(kv_block_start + BLOCK_N, kv_seq_len)
             kv_block_len = kv_block_end - kv_block_start
@@ -2369,8 +2354,31 @@ def _swa_bwd_dkdv_kernel(
                 LOCAL_WINDOW,
             )
 
-            dk = tl.zeros((BLOCK_N, HEAD_DIM), dtype=tl.float32)
-            dv = tl.zeros((BLOCK_N, HEAD_DIM), dtype=tl.float32)
+            dk = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+            dv = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+
+            # hoist kv-only masks (kv_mask, mask_gw bounds) out of the inner q-block loop.
+            kv_mask_hoist = gen_mask_m_right_bound(
+                aux_mask_ptr_10t,
+                aux_mask_size,
+                stride_mask_m,
+                stride_mask_n,
+                BLOCK_N,
+                BLOCK_M,
+                kv_block_start,
+                kv_seq_len,
+            )
+            if IS_CAUSAL and (GLOBAL_WINDOW is not None):
+                mask_gw_hoist = gen_mask_m_right_bound(
+                    aux_mask_ptr_10t,
+                    aux_mask_size,
+                    stride_mask_m,
+                    stride_mask_n,
+                    BLOCK_N,
+                    BLOCK_M,
+                    kv_block_start,
+                    GLOBAL_WINDOW,
+                )
 
             # For GQA, iterate over all q_heads
             for q_head_rpt in tl.static_range(NUM_Q_HEADS // NUM_KV_HEADS):
@@ -2410,16 +2418,8 @@ def _swa_bwd_dkdv_kernel(
                         q_block_start,
                         q_seq_len,
                     )
-                    kv_mask = gen_mask_m_right_bound(
-                        aux_mask_ptr_10t,
-                        aux_mask_size,
-                        stride_mask_m,
-                        stride_mask_n,
-                        BLOCK_N,
-                        BLOCK_M,
-                        kv_block_start,
-                        kv_seq_len,
-                    )
+                    # kv_mask only depends on kv_block_start — hoisted above the q-loop.
+                    kv_mask = kv_mask_hoist
                     if IS_CAUSAL:
                         mask_causal = gen_mask_triu(
                             aux_mask_ptr_triu,
@@ -2432,16 +2432,8 @@ def _swa_bwd_dkdv_kernel(
                             q_block_start + kv_computed_len,
                         )
                         if GLOBAL_WINDOW is not None:
-                            mask_gw = gen_mask_m_right_bound(
-                                aux_mask_ptr_10t,
-                                aux_mask_size,
-                                stride_mask_m,
-                                stride_mask_n,
-                                BLOCK_N,
-                                BLOCK_M,
-                                kv_block_start,
-                                GLOBAL_WINDOW,
-                            )
+                            # global window mask hoisted (depends only on kv_block_start vs GLOBAL_WINDOW).
+                            mask_gw = mask_gw_hoist
                             if LOCAL_WINDOW is not None:
                                 mask_sw = gen_mask_tril(
                                     aux_mask_ptr_tril,
@@ -2540,7 +2532,7 @@ def _swa_bwd_dkdv_kernel(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
         for BM in [64, 128]
-        for BN in [64, 128]
+        for BN in [64]
         for MF in [True, False]
     ],
     key=["HEAD_DIM"],
@@ -2711,8 +2703,12 @@ def _swa_bwd_dq_kernel(
             cur_delta = tl.load(delta_i_ptr + q_offs, q_offs < q_seq_len, other=0.0)
             cur_lse = tl.load(lse_i_ptr + q_offs, q_offs < q_seq_len, other=-float("inf"))
 
+            # hoist q-loop invariants — q_block_start + kv_computed_len recurs in every
+            # mask construction inside the kv loop; precompute once.
+            q_kv_pos = q_block_start + kv_computed_len
+
             num_global_window_blocks, non_global_window_start_block, num_total_blocks = _swa_split_blocks(
-                q_block_start + kv_computed_len,
+                q_kv_pos,
                 q_block_len,
                 kv_seq_len,
                 BLOCK_N,
@@ -2720,7 +2716,14 @@ def _swa_bwd_dq_kernel(
                 GLOBAL_WINDOW,
                 LOCAL_WINDOW,
             )
-            dq = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+            # clamp num_total_blocks to kv_seq_len-aware causal upper so cache-shape
+            # (kv_seq_len > q_seq_len + kv_computed_len overestimate) stops iterating
+            # empty tail kv blocks. Math: kv positions reachable from this q-block max
+            # out at q_block_end - 1 + kv_computed_len, so cdiv((..)+1, BLOCK_N) is tight.
+            kv_block_cap = tl.cdiv(min(q_kv_pos + q_block_len, kv_seq_len), BLOCK_N)
+            if num_total_blocks > kv_block_cap:
+                num_total_blocks = kv_block_cap
+            dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
             for kv_block_id in range(num_global_window_blocks):
                 kv_block_start = kv_block_id * BLOCK_N
@@ -2753,7 +2756,7 @@ def _swa_bwd_dq_kernel(
                             stride_mask_n,
                             BLOCK_M,
                             BLOCK_N,
-                            q_block_start + kv_computed_len,
+                            q_kv_pos,
                             kv_block_start + LOCAL_WINDOW,
                         )
                         mask_gw = mask_gw | mask_sw
@@ -2764,7 +2767,7 @@ def _swa_bwd_dq_kernel(
                         stride_mask_n,
                         BLOCK_M,
                         BLOCK_N,
-                        q_block_start + kv_computed_len,
+                        q_kv_pos,
                         kv_block_start,
                     )
                     mask_causal = mask_gw & mask_causal
@@ -2826,7 +2829,7 @@ def _swa_bwd_dq_kernel(
                         stride_mask_n,
                         BLOCK_M,
                         BLOCK_N,
-                        q_block_start + kv_computed_len,
+                        q_kv_pos,
                         kv_block_start,
                     )
                     if LOCAL_WINDOW is not None:
@@ -2837,7 +2840,7 @@ def _swa_bwd_dq_kernel(
                             stride_mask_n,
                             BLOCK_M,
                             BLOCK_N,
-                            q_block_start + kv_computed_len,
+                            q_kv_pos,
                             kv_block_start + LOCAL_WINDOW,
                         )
                         mask_causal = mask_causal & mask_sw
@@ -2910,9 +2913,13 @@ def swa_bwd_impl(
     tot_q_toks, num_q_heads, head_dim = q.shape
     tot_kv_toks, num_kv_heads, _ = k.shape
 
-    delta = torch.zeros((num_q_heads, tot_q_toks), dtype=torch.float32, device=q.device)
-    o = o.contiguous()
-    do = do.contiguous()
+    # preprocess writes every (head, token) delta element before use; avoid device memset.
+    delta = torch.empty((num_q_heads, tot_q_toks), dtype=torch.float32, device=q.device)
+    # avoid redundant contiguous copies for the common already-contiguous path.
+    if not o.is_contiguous():
+        o = o.contiguous()
+    if not do.is_contiguous():
+        do = do.contiguous()
 
     num_vecs = get_num_cores("vector")
     _swa_bwd_preprocess[(num_vecs,)](
@@ -2932,16 +2939,44 @@ def swa_bwd_impl(
         head_dim,
     )
     if softmax_scale is None:
-        softmax_scale = 1.0 / (head_dim**0.5)
+        # static branches for the only observed head_dim constants avoid Python pow.
+        if head_dim == 128:
+            softmax_scale = 0.08838834764831845
+        elif head_dim == 96:
+            softmax_scale = 0.10206207261596575
+        else:
+            softmax_scale = 1.0 / (head_dim**0.5)
 
-    dq = torch.zeros_like(q, memory_format=torch.contiguous_format)
+    # dq kernel writes every q/head tile, so dq needs no initial memset.
+    dq = torch.empty_like(q, memory_format=torch.contiguous_format)
     dk = torch.zeros_like(k, memory_format=torch.contiguous_format)
     dv = torch.zeros_like(v, memory_format=torch.contiguous_format)
 
+    # use 128-wide cube tile for head_dim=96 and match accumulator shapes to BLOCK_D.
+    # NOTE: disabled because it causes large k.grad discrepancies on head_dim=96 bf16.
+    # BLOCK_D = 128 if head_dim == 96 else head_dim
     BLOCK_D = head_dim
+    BLOCK_M = 64
+    BLOCK_N = 64
     cube_num = get_num_cores("cube")
 
     grid = (cube_num,)
+
+    # pre-build host-side task table for dkdv (b_id, kv_block_id, kv_head_id)
+    cu_kv_cpu = cu_total_seq_lens.detach().cpu().tolist()
+    cu_q_cpu = cu_q_lens.detach().cpu().tolist()
+    task_entries = []
+    for b_id in range(bsz):
+        kv_len = cu_kv_cpu[b_id + 1] - cu_kv_cpu[b_id]
+        num_kv_chunks = (kv_len + BLOCK_N - 1) // BLOCK_N
+        for kv_block_id in range(num_kv_chunks):
+            for kv_head_id in range(num_kv_heads):
+                task_entries.append((b_id, kv_block_id, kv_head_id))
+    num_tasks_total = len(task_entries)
+    if num_tasks_total == 0:
+        # nothing to do
+        return dq, dk, dv
+    task_table = torch.tensor(task_entries, dtype=torch.int32, device=q.device).reshape(-1)
 
     _swa_bwd_dkdv_kernel[grid](
         dk,
@@ -2955,6 +2990,8 @@ def swa_bwd_impl(
         bsz,
         cu_q_lens,
         cu_total_seq_lens,
+        task_table,
+        num_tasks_total,
         softmax_scale,
         dk.stride(0),
         dk.stride(1),
