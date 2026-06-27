@@ -11,13 +11,11 @@ from mojo_opset.backends.ttx.kernels.utils import prepare_chunk_indices
 
 
 @triton.jit
-def causal_mask_fn(mask_ptr, mask_size, mask_stride_m, mask_stride_n, q_start, kv_start, Q_BLOCK, KV_BLOCK):
-    offset_causal = min(max(kv_start - q_start, -mask_size), mask_size)
-    offsets_mask_causal = (
-        (tl.arange(0, Q_BLOCK)[:, None]) * mask_stride_m
-        + (mask_size + offset_causal + tl.arange(0, KV_BLOCK)[None, :]) * mask_stride_n
-    )
-    mask_causal = tl.load(mask_ptr + offsets_mask_causal).to(tl.int1)
+def causal_mask_fn(q_start, kv_start, Q_BLOCK, KV_BLOCK):
+    # pure arithmetic causal mask: kv_pos <= q_pos (no aux_mask lookup table)
+    q_pos = q_start + tl.arange(0, Q_BLOCK)[:, None]
+    kv_pos = kv_start + tl.arange(0, KV_BLOCK)[None, :]
+    mask_causal = kv_pos <= q_pos
 
     return mask_causal
 
@@ -50,7 +48,7 @@ def _sdpa_infer_single_block(
     if mask is not None:
         qk = tl.where(mask, qk, float("-inf"))  # 32B # bool
 
-    m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)    # Scaled max
+    m_ij = tl.maximum(m_i, tl.max(qk, 1))  # Scaled max
     qk = qk - m_ij[:, None]  # Stabilize
 
     # Softmax weights p = exp(qk)
@@ -85,7 +83,6 @@ def paged_prefill_kernel(
     key_cache_ptr,
     value_cache_ptr,
     o_ptr,
-    aux_mask_ptr,
     batch_size,
     cu_q_lens_ptr,
     seqlens_kv_ptr,
@@ -106,10 +103,7 @@ def paged_prefill_kernel(
     stride_od,
     stride_bt_batch,
     stride_bt_block,
-    stride_mask_m,
-    stride_mask_n,
     softmax_scale,
-    AUX_MASK_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -183,7 +177,7 @@ def paged_prefill_kernel(
                 kv_block_start_in_seq = kv_block_id * BLOCK_SIZE_N
                 kv_block_end_in_seq = min(kv_block_start_in_seq + BLOCK_SIZE_N, kv_seq_len)
                 kv_block_len = kv_block_end_in_seq - kv_block_start_in_seq
-                
+
                 logical_page_id = kv_block_start_in_seq // PAGE_SIZE
                 kv_block_start_in_page = kv_block_start_in_seq % PAGE_SIZE
                 physical_page_id = tl.load(
@@ -208,10 +202,6 @@ def paged_prefill_kernel(
                 )
 
                 mask = causal_mask_fn(
-                    aux_mask_ptr,
-                    AUX_MASK_SIZE,
-                    stride_mask_m,
-                    stride_mask_n,
                     kv_cache_len + q_block_start_in_seq,
                     kv_block_start_in_seq,
                     BLOCK_SIZE_M,
@@ -234,13 +224,7 @@ def paged_prefill_kernel(
                     value_cache_ptr.dtype.element_ty == tl.float8e5,
                 )
 
-            m_i += tl.math.log(l_i)
-            accumulator = acc / l_i[:, None]
-
-            # NOTE(zhangjihang): for training
-            # m_ptrs = M + task_bn_idx * sub_kv_len + offs_m
-            # tl.store(m_ptrs, m_i)
-            tl.store(O_block_ptr, accumulator.to(o_ptr.type.element_ty), boundary_check=(0, 1))
+            tl.store(O_block_ptr, (acc / l_i[:, None]).to(o_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 def paged_attention_prefill_impl(
@@ -252,7 +236,6 @@ def paged_attention_prefill_impl(
     block_tables: torch.Tensor,
     gqa_interleave: bool,
     softmax_scale: Optional[float] = None,
-    aux_mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     max_total_seq_len: Optional[int] = None,
 ) -> torch.Tensor:
@@ -262,9 +245,6 @@ def paged_attention_prefill_impl(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-
-    if aux_mask is None:
-        aux_mask = torch.ones(1024, 1024 * 3, device="npu", dtype=torch.bool).tril(1024)
 
     # Note(chenyifan):
     #   In general, this paged attention kernel works in a `split-q` style.
@@ -276,7 +256,16 @@ def paged_attention_prefill_impl(
 
     o = torch.empty_like(q)
 
-    CHUNK_SIZE = 128
+    # Safe shape-adaptive BLOCK_SIZE_M: use 64 for very short Q sequences to
+    # reduce padding waste; keep 128 (proven safe) for all other shapes.
+    # BLOCK_SIZE_M=256 triggered MLIR compilation failure, so we cap at 128.
+    # causal mask is computed arithmetically in-kernel, so no aux_mask tensor.
+    if max_q_len is not None and max_q_len > 0:
+        chunk_size = 64 if max_q_len <= 256 else 128
+    else:
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        max_q = q_lens.max().item() if q_lens.numel() > 0 else 0
+        chunk_size = 64 if max_q <= 256 else 128
     BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
     cube_num = get_num_cores("cube")
     grid = (cube_num,)
@@ -286,7 +275,6 @@ def paged_attention_prefill_impl(
         key_cache,
         value_cache,
         o,
-        aux_mask,
         batch_size,
         cu_q_lens,
         seqlens_kv,
@@ -307,32 +295,45 @@ def paged_attention_prefill_impl(
         o.stride(2),
         block_tables.stride(0),
         block_tables.stride(1),
-        aux_mask.stride(0),
-        aux_mask.stride(1),
         softmax_scale,
-        aux_mask.shape[0],
         page_size,
         num_q_heads,
         num_kv_heads,
         gqa_interleave,
         head_dim,
-        BLOCK_SIZE_M=CHUNK_SIZE,
+        BLOCK_SIZE_M=chunk_size,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_D=head_dim,
+        limit_auto_multi_buffer_only_for_local_buffer=False,
+        set_workspace_multibuffer=4,
     )
     return o
 
 
+# ============================================================================
+# Paged Decode (Flash Attention - Decode path)
+#
+# Two-stage flash-decoding split / merge:
+# - Stage1 partial: grid (num_tasks, num_splits), each program computes a
+#   segment of KV's partial (m_i, l_i, acc) without final normalization; empty
+#   splits keep the identity element (m=-inf, l=0, acc=0).
+# - Stage2 merge: each task merges num_splits partials using the associativity
+#   of online-softmax; for all-empty sequences (m_global == -inf) write 0
+#   directly, avoiding exp(-inf - -inf) = NaN and 0/0 NaN.
+# Full fp32 accumulation.
+# ============================================================================
+
+
 @triton.jit
-def paged_decode_kernel(
+def paged_decode_partial_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
-    o_ptr,
+    partial_ptr,  # [num_tasks, num_splits, HEAD_DIM + 2] fp32  (or o_ptr when WRITE_OUTPUT)
     seqlens_ptr,
     block_tables_ptr,
     BATCH_SIZE,
-    NUM_TOTAL_BLOCKS,
+    NUM_SPLITS,
     MAX_NUM_BLOCKS_PER_SEQ,
     stride_qb,
     stride_qh,
@@ -345,73 +346,88 @@ def paged_decode_kernel(
     stride_v_head,
     stride_v_blksz,
     stride_v_dim,
-    stride_ob,
-    stride_oh,
-    stride_od,
+    stride_pt_task,
+    stride_pt_split,
+    stride_pt_entry,
     stride_bt_batch,
     stride_bt_block,
     softmax_scale,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
-    GQA_INTERLEAVE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,  # q-heads per kv-head group (Hq // Hkv)
+    GROUP_M: tl.constexpr,     # padded power-of-two >= GROUP_SIZE, M dim of tl.dot
+    GQA_INTERLEAVE: tl.constexpr,  # ABAB if True, AABB otherwise
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr,  # write acc/l_i straight to o, skip merge
+    stride_ob,
+    stride_oh,
+    stride_od,
 ):
-    GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     tl.static_assert(HEAD_DIM <= BLOCK_SIZE_D, "HEAD_DIM should be less than BLOCK_SIZE_D")
     tl.static_assert(PAGE_SIZE % BLOCK_SIZE_N == 0, "BLOCK_SIZE_N must be a divisor of PAGE_SIZE")
-    pid = tl.program_id(0)
-    n_progs = tl.num_programs(0)
 
-    num_tasks = BATCH_SIZE * NUM_KV_HEADS
+    # Group one batch's q-heads into a (GROUP_M, D) block and use tl.dot (cube
+    # engine) for QK and PV. Each program = (batch, split); it loops the Hkv
+    # groups. The whole acc tile is stored with a row mask.
+    b_id = tl.program_id(0)
+    split_id = tl.program_id(1)
 
-    for kv_task_id in range(pid, num_tasks, n_progs):
-        kv_head_id = kv_task_id % NUM_KV_HEADS
-        b_id = kv_task_id // NUM_KV_HEADS
+    kv_seq_len = tl.load(seqlens_ptr + b_id)
 
-        kv_seq_len = tl.load(seqlens_ptr + b_id)
+    offs_d = tl.arange(0, BLOCK_SIZE_D)
+    offs_m = tl.arange(0, GROUP_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    q_row_valid = offs_m < GROUP_SIZE
 
-        # Compute q_head_ids for this kv_head group
-        g_offsets = tl.arange(0, GROUP_SIZE)
+    num_kv_blocks = tl.cdiv(kv_seq_len, BLOCK_SIZE_N)
+    blocks_per_split = tl.cdiv(num_kv_blocks, NUM_SPLITS)
+    start_block = split_id * blocks_per_split
+    end_block = tl.minimum((split_id + 1) * blocks_per_split, num_kv_blocks)
+
+    for kv_head_id in range(0, NUM_KV_HEADS):
+        # q-head ids covered by this kv-head group, indexed by offs_m. Layout:
+        #   ABAB (GQA_INTERLEAVE): kv_head_id + g * NUM_KV_HEADS
+        #   AABB (contiguous)   : kv_head_id * GROUP_SIZE + g
+        # padded rows (offs_m >= GROUP_SIZE) produce out-of-range ids but are
+        # masked away by q_row_valid, so they never read/write real memory.
         if GQA_INTERLEAVE:
-            q_head_ids = kv_head_id + g_offsets * NUM_KV_HEADS
+            q_head_ids = kv_head_id + offs_m * NUM_KV_HEADS
         else:
-            q_head_ids = kv_head_id * GROUP_SIZE + g_offsets
+            q_head_ids = kv_head_id * GROUP_SIZE + offs_m
+        task_ids = b_id * NUM_Q_HEADS + q_head_ids
 
-        # Load q for all heads in the group: [GROUP_SIZE, D]
-        offs_d = tl.arange(0, BLOCK_SIZE_D)
+        # load Q block (GROUP_M, HEAD_DIM); padded rows = 0
         q_ptrs = q_ptr + b_id * stride_qb + q_head_ids[:, None] * stride_qh + offs_d[None, :] * stride_qd
-        q = tl.load(q_ptrs, mask=offs_d[None, :] < HEAD_DIM, other=0.0)
+        q = tl.load(q_ptrs, mask=q_row_valid[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0)
 
-        # Initialize softmax state as vectors [GROUP_SIZE,]
-        m_i = tl.zeros((GROUP_SIZE,), dtype=tl.float32) - float("inf")
-        l_i = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
-        acc = tl.zeros((GROUP_SIZE, BLOCK_SIZE_D), dtype=tl.float32)
+        m_i = tl.full((GROUP_M,), -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros((GROUP_M,), dtype=tl.float32)
+        acc = tl.zeros((GROUP_M, BLOCK_SIZE_D), dtype=tl.float32)
 
-        num_kv_blocks = tl.cdiv(kv_seq_len, BLOCK_SIZE_N)
-
-        for kv_block_id in range(0, num_kv_blocks):
+        # software-pipelining hint so the next K/V load overlaps the current
+        # softmax+PV (compiler-issued prefetch), hiding DRAM latency on the
+        # long-context cases. num_stages=2 double-buffers K/V.
+        for kv_block_id in tl.range(start_block, end_block, num_stages=2):
             kv_block_start_in_seq = kv_block_id * BLOCK_SIZE_N
-            kv_block_end_in_seq = min(kv_block_start_in_seq + BLOCK_SIZE_N, kv_seq_len)
+            kv_block_end_in_seq = tl.minimum(kv_block_start_in_seq + BLOCK_SIZE_N, kv_seq_len)
             kv_block_len = kv_block_end_in_seq - kv_block_start_in_seq
-            
+
             logical_page_id = kv_block_start_in_seq // PAGE_SIZE
             kv_block_start_in_page = kv_block_start_in_seq % PAGE_SIZE
             physical_page_id = tl.load(block_tables_ptr + b_id * stride_bt_batch + logical_page_id * stride_bt_block)
 
-            # Load K transposed: [D, BLOCK_N] for tl.dot(q, k_T)
-            K_T_block_ptr = tl.make_block_ptr(
+            k_block_ptr = tl.make_block_ptr(
                 base=k_cache_ptr + physical_page_id * stride_k_block + kv_head_id * stride_k_head + kv_block_start_in_page * stride_k_blksz,
-                shape=(HEAD_DIM, kv_block_len),
-                strides=(stride_k_dim, stride_k_blksz),
+                shape=(kv_block_len, HEAD_DIM),
+                strides=(stride_k_blksz, stride_k_dim),
                 offsets=(0, 0),
-                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_N),
-                order=(0, 1),
+                block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
+                order=(1, 0),
             )
-            # Load V: [BLOCK_N, D] for tl.dot(p, v)
-            V_block_ptr = tl.make_block_ptr(
+            v_block_ptr = tl.make_block_ptr(
                 base=v_cache_ptr + physical_page_id * stride_v_block + kv_head_id * stride_v_head + kv_block_start_in_page * stride_v_blksz,
                 shape=(kv_block_len, HEAD_DIM),
                 strides=(stride_v_blksz, stride_v_dim),
@@ -420,41 +436,120 @@ def paged_decode_kernel(
                 order=(1, 0),
             )
 
-            mask = tl.arange(0, BLOCK_SIZE_N) < kv_block_len
+            mask_n = offs_n < kv_block_len
 
-            k_T = tl.load(K_T_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            v = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            k = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-            qk = tl.dot(q, k_T)
+            # QK = Q (GROUP_M, D) @ K^T (D, N) -> (GROUP_M, N) via cube tl.dot.
+            qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * softmax_scale
+            qk = tl.where(mask_n[None, :], qk, float("-inf"))
 
-            qk *= softmax_scale
-            qk = tl.where(mask[None, :], qk, float("-inf"))
-
-            m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
+            m_j = tl.max(qk, axis=1)
+            m_ij = tl.maximum(m_i, m_j)
             qk = qk - m_ij[:, None]
 
             p = tl.math.exp(qk)
-            p_cast = p.to(k_T.dtype)
 
-            pv = tl.dot(p_cast, v)
+            v = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
 
-            # Softmax denominator and update (Vector: parallel with Cube)
-            l_ij = tl.sum(p, 1)
+            l_ij = tl.sum(p, axis=1)
+
             alpha = tl.math.exp(m_i - m_ij)
 
             l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, None] + pv
+
+            acc = acc * alpha[:, None]
+
+            # PV = P (GROUP_M, N) @ V (N, D) -> (GROUP_M, D) via cube tl.dot,
+            # accumulated into acc in fp32.
+            acc = tl.dot(p.to(v.dtype), v, acc=acc)
 
             m_i = m_ij
 
-        m_i += tl.math.log(l_i)
-        if kv_seq_len > 0:
-            # avoid division by zero
-            acc = acc / l_i[:, None]
+        # when WRITE_OUTPUT, this program is the only split, so the partial IS
+        # the final answer up to the divide — write acc/l_i straight to o and
+        # skip the merge kernel. Otherwise store partials.
+        if WRITE_OUTPUT:
+            is_empty = m_i == -float("inf")
+            l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+            out = acc / l_safe[:, None]
+            out = tl.where(is_empty[:, None], 0.0, out)
+            o_ptrs = (
+                partial_ptr
+                + b_id * stride_ob
+                + q_head_ids[:, None] * stride_oh
+                + offs_d[None, :] * stride_od
+            )
+            tl.store(o_ptrs, out.to(partial_ptr.dtype.element_ty), mask=q_row_valid[:, None] & (offs_d[None, :] < HEAD_DIM))
+        else:
+            partial_base = partial_ptr + split_id * stride_pt_split
+            acc_ptrs = (
+                partial_base
+                + task_ids[:, None] * stride_pt_task
+                + offs_d[None, :] * stride_pt_entry
+            )
+            tl.store(acc_ptrs, acc, mask=q_row_valid[:, None] & (offs_d[None, :] < HEAD_DIM))
+            lm_ptrs = partial_base + task_ids * stride_pt_task
+            tl.store(lm_ptrs + HEAD_DIM * stride_pt_entry, l_i, mask=q_row_valid)
+            tl.store(lm_ptrs + (HEAD_DIM + 1) * stride_pt_entry, m_i, mask=q_row_valid)
 
-        # Store output for all heads in the group
-        o_ptrs = o_ptr + b_id * stride_ob + q_head_ids[:, None] * stride_oh + offs_d[None, :] * stride_od
-        tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=offs_d[None, :] < HEAD_DIM)
+
+@triton.jit
+def paged_decode_merge_kernel(
+    partial_ptr,  # [num_tasks, num_splits, HEAD_DIM + 2] fp32
+    o_ptr,
+    NUM_SPLITS,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    stride_pt_task,
+    stride_pt_split,
+    stride_pt_entry,
+    NUM_Q_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    task_id = tl.program_id(0)
+
+    b_id = task_id // NUM_Q_HEADS
+    q_head_id = task_id % NUM_Q_HEADS
+
+    offs_d = tl.arange(0, BLOCK_SIZE_D)
+
+    # first pass: global max m (== -inf iff every split is empty, i.e. seq_len==0)
+    m_global = -float("inf")
+    for s in range(0, NUM_SPLITS):
+        m_s = tl.load(partial_ptr + task_id * stride_pt_task + s * stride_pt_split + (HEAD_DIM + 1) * stride_pt_entry)
+        m_global = tl.maximum(m_global, m_s)
+
+    is_empty = m_global == -float("inf")
+
+    # second pass: accumulate l and acc with rescale. Replace m_s == -inf
+    # (empty split) with m_global so m_s - m_global == 0 instead of NaN;
+    # those splits contribute l_s=0 and acc_s=0 so the rescale is harmless.
+    l_global = 0.0
+    acc_global = tl.zeros((BLOCK_SIZE_D,), dtype=tl.float32)
+    for s in range(0, NUM_SPLITS):
+        m_s = tl.load(partial_ptr + task_id * stride_pt_task + s * stride_pt_split + (HEAD_DIM + 1) * stride_pt_entry)
+        m_s_safe = tl.where(m_s == -float("inf"), m_global, m_s)
+        l_s = tl.load(partial_ptr + task_id * stride_pt_task + s * stride_pt_split + HEAD_DIM * stride_pt_entry)
+        acc_s = tl.load(
+            partial_ptr + task_id * stride_pt_task + s * stride_pt_split + offs_d * stride_pt_entry,
+            mask=offs_d < HEAD_DIM,
+            other=0.0,
+        )
+        alpha = tl.math.exp(m_s_safe - m_global)
+        l_global += l_s * alpha
+        acc_global += acc_s * alpha
+
+    # guard division: l_global is 0 only when is_empty; replace with 1.0 to
+    # avoid 0/0 = NaN, then overwrite the whole output with 0 for empty tasks.
+    l_safe = tl.where(l_global > 0.0, l_global, 1.0)
+    out = acc_global / l_safe
+    out = tl.where(is_empty, 0.0, out)
+
+    o_ptrs = o_ptr + b_id * stride_ob + q_head_id * stride_oh + offs_d * stride_od
+    tl.store(o_ptrs, out.to(o_ptr.dtype.element_ty), mask=offs_d < HEAD_DIM)
 
 
 def paged_attention_decode_impl(
@@ -477,20 +572,53 @@ def paged_attention_decode_impl(
 
     o = torch.empty_like(q)
 
-    cube_num = get_num_cores("cube")
-    grid = (cube_num,)
+    num_tasks = batch_size * num_q_heads
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
-    BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
+    # page-aligned, UB-safe KV tile: largest power-of-two divisor of PAGE_SIZE
+    # capped at 128 (page=1024 with 256 overflows UB).
+    cap = 128
+    bsn = cap
+    while page_size % bsn != 0:
+        bsn //= 2
+    BLOCK_SIZE_N = bsn
 
-    paged_decode_kernel[grid](
+    # split count: parallelize the KV reduction across programs; only split
+    # when the longest sequence actually has many KV blocks so short-seq
+    # shapes degenerate to NUM_SPLITS=1.
+    max_seq_len = int(seqlens.max().item())
+    max_kv_blocks = (max_seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    max_kv_blocks = max(max_kv_blocks, 1)
+    NUM_SPLITS_CAP = 8
+    num_splits = max(min(NUM_SPLITS_CAP, max_kv_blocks), 1)
+
+    # partial buffer: [num_tasks, num_splits, head_dim + 2] fp32
+    # last 2 entries per (task,split): [l_i, m_i]
+    partial = torch.empty(
+        (num_tasks, num_splits, head_dim + 2),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    # group q-heads per kv-head. GROUP_M is a power-of-two >= GROUP_SIZE and
+    # >= 8 so tl.dot's M dim is valid for the cube engine.
+    group_size = num_q_heads // num_kv_heads
+    group_m = triton.next_power_of_2(max(group_size, 8))
+
+    # when num_splits == 1 the partial is the final answer up to the divide;
+    # dispatch the partial kernel with WRITE_OUTPUT=True straight into o and
+    # skip the merge kernel (and the partial buffer alloc).
+    single_kernel = (num_splits == 1)
+
+    grid_partial = (batch_size, num_splits)
+    paged_decode_partial_kernel[grid_partial](
         q,
         key_cache,
         value_cache,
-        o,
+        o if single_kernel else partial,
         seqlens,
         block_tables,
         batch_size,
-        num_total_blocks,
+        num_splits,
         max_num_blocks_per_seq,
         q.stride(0),
         q.stride(1),
@@ -503,18 +631,42 @@ def paged_attention_decode_impl(
         value_cache.stride(1),
         value_cache.stride(2),
         value_cache.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
+        partial.stride(0) if not single_kernel else o.stride(0),
+        partial.stride(1) if not single_kernel else o.stride(1),
+        partial.stride(2) if not single_kernel else o.stride(2),
         block_tables.stride(0),
         block_tables.stride(1),
         softmax_scale,
         num_q_heads,
         num_kv_heads,
+        group_size,
+        group_m,
         gqa_interleave,
         head_dim,
         page_size,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        WRITE_OUTPUT=single_kernel,
+        stride_ob=o.stride(0),
+        stride_oh=o.stride(1),
+        stride_od=o.stride(2),
+        multibuffer=False,
     )
+
+    if not single_kernel:
+        grid_merge = (num_tasks,)
+        paged_decode_merge_kernel[grid_merge](
+            partial,
+            o,
+            num_splits,
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            partial.stride(0),
+            partial.stride(1),
+            partial.stride(2),
+            num_q_heads,
+            head_dim,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+        )
     return o
